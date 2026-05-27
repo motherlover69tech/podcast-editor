@@ -1,0 +1,43 @@
+[project]
+name = "podcast-editor"
+version = "0.1.0"
+description = "AI-assisted podcast/video editor — ingest, analyze, auto-edit, export to DaVinci Resolve"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "librosa>=0.10",
+    "soundfile>=0.12",
+    "pydub>=0.25",
+    "lxml>=4.9",
+    "scikit-learn>=1.2",
+    "sentence-transformers>=2.2",
+    "rich>=13",
+    "typer>=0.9",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "ffmpeg-python>=0.2",
+    "faster-whisper>=1.0",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "whisperx>=3.1",
+    "torch>=2.0",
+]
+diarization = [
+    "pyannote.audio>=3.1",
+]
+web = [
+    "fastapi>=0.109",
+    "uvicorn>=0.27",
+    "python-multipart>=0.0.6",
+    "pyyaml>=6.0",
+]
+
+[project.scripts]
+podcast-edit = "src.cli:app"
+podcast-edit-web = "src.web:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
