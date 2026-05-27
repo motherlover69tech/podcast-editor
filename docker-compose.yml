@@ -1,0 +1,35 @@
+# podcast-editor — Unraid Docker Compose
+#
+# Usage:
+#   docker compose up -d
+#
+# GPU (optional): uncomment the deploy section if you have an NVIDIA card
+# CPU-only: remove the deploy section — the container will use faster-whisper on CPU
+
+version: "3.8"
+
+services:
+  podcast-editor:
+    build: .
+    container_name: podcast-editor
+    ports:
+      - "8890:8890"
+    volumes:
+      # Store projects on your disk array
+      - /mnt/user/media/podcast-projects:/data
+      # Optional: mount raw footage directly (read-only)
+      # - /mnt/user/media/raw-footage:/footage:ro
+    environment:
+      - PODCAST_EDITOR_DATA=/data
+      - HF_TOKEN=${HF_TOKEN}
+      - TZ=Europe/London
+    restart: unless-stopped
+    # GPU acceleration (Quadro M4000 or any NVIDIA card)
+    # Remove this section for CPU-only
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
