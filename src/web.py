@@ -42,10 +42,7 @@ def main():
     import uvicorn
     uvicorn.run("src.web:app", host="0.0.0.0", port=8890, reload=True)
 
-# ── In-memory project store (replace with DB for production) ─────────────────
-
-# ── Storage: configurable via PODCAST_EDITOR_DATA env var ─────────────────────
-# On Unraid, set to: /mnt/user/media/podcast-editor-projects/
+# ── Storage: projects live under PODCAST_EDITOR_DATA (e.g. /mnt/user/media/Auto edit/) ──
 
 WORK_DIR = Path(os.environ.get("PODCAST_EDITOR_DATA", "./projects"))
 WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,8 +50,35 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 projects: dict[str, dict] = {}
 
 
+def _slug(name: str) -> str:
+    """Convert a project name to a safe folder name."""
+    import re
+    slug = name.lower().strip()
+    slug = re.sub(r'[^a-z0-9]+', '-', slug)
+    return slug.strip('-')[:64]
+
+
 def _project_dir(project_id: str) -> Path:
-    return WORK_DIR / project_id
+    """Resolve project dir — accepts slug or raw name."""
+    # Try direct match first
+    direct = WORK_DIR / project_id
+    if direct.exists():
+        return direct
+    # Try slugified
+    slugged = WORK_DIR / _slug(project_id)
+    if slugged.exists():
+        return slugged
+    # New projects use slugged path
+    return slugged
+
+
+def _list_project_dirs() -> list[Path]:
+    """Return all valid project directories."""
+    dirs = []
+    for d in sorted(WORK_DIR.iterdir()):
+        if d.is_dir() and (d / "project.yaml").exists():
+            dirs.append(d)
+    return dirs
 
 
 def _get_config(project_id: str) -> ProjectConfig:
@@ -122,20 +146,61 @@ class ConfigUpdateRequest(BaseModel):
 
 # ── API Endpoints ────────────────────────────────────────────────────────────
 
+@app.get("/api/projects/")
+async def list_projects():
+    """List all projects with basic status."""
+    results = []
+    for d in _list_project_dirs():
+        import yaml
+        cfg = yaml.safe_load((d / "project.yaml").read_text())
+        has_analysis = (d / "analysis.json").exists()
+        analysis = {}
+        if has_analysis:
+            try:
+                a = AnalysisResult.model_validate_json((d / "analysis.json").read_text())
+                analysis = {"duration_min": round(a.duration / 60, 1), "words": len(a.words)}
+            except Exception:
+                pass
+        results.append({
+            "id": d.name,
+            "name": cfg.get("name", d.name),
+            "sources": len(cfg.get("sources", [])),
+            "has_analysis": has_analysis,
+            "analysis": analysis,
+        })
+    return {"projects": results}
+
+
 @app.post("/api/projects/", response_model=ProjectCreateResponse)
-async def create_project(
-    name: str = Form(...),
-    files: list[UploadFile] = File(...),
-):
-    """Create a new project from uploaded video files."""
-    project_id = uuid.uuid4().hex[:12]
-    proj_dir = _project_dir(project_id)
+async def create_project(name: str = Form(...)):
+    """Create a new empty project. Files are uploaded separately."""
+    pid = _slug(name)
+    proj_dir = WORK_DIR / pid
+    if proj_dir.exists():
+        raise HTTPException(409, f"Project '{pid}' already exists")
+
     proj_dir.mkdir(parents=True, exist_ok=True)
+    (proj_dir / "media").mkdir(exist_ok=True)
+
+    config = ProjectConfig(name=name, sources=[], wide_camera="")
+
+    import yaml
+    (proj_dir / "project.yaml").write_text(
+        yaml.dump(config.model_dump(), default_flow_style=False)
+    )
+
+    return ProjectCreateResponse(project_id=pid, sources=[])
+
+
+@app.post("/api/projects/{project_id}/files")
+async def upload_files(project_id: str, files: list[UploadFile] = File(...)):
+    """Upload video files to an existing project."""
+    config = _get_config(project_id)
+    proj_dir = _project_dir(project_id)
     media_dir = proj_dir / "media"
     media_dir.mkdir(exist_ok=True)
 
-    # Save uploaded files
-    sources = []
+    new_sources = []
     for f in files:
         safe_name = f.filename.replace("/", "_").replace("\\", "_")
         dest = media_dir / safe_name
@@ -143,7 +208,6 @@ async def create_project(
             while chunk := await f.read(1024 * 1024):
                 out.write(chunk)
 
-        # Guess role from filename
         name_lower = safe_name.lower()
         role = "angle"
         if any(kw in name_lower for kw in ("wide", "full", "master", "room")):
@@ -151,45 +215,29 @@ async def create_project(
         elif any(kw in name_lower for kw in ("main", "primary", "host", "a-cam")):
             role = "primary"
 
-        sources.append({
-            "name": Path(safe_name).stem,
-            "filename": safe_name,
-            "role": role,
-            "file_path": str(dest),
-            "channels": {},
-        })
+        src = CameraSource(
+            name=Path(safe_name).stem,
+            file_path=str(dest),
+            label=Path(safe_name).stem,
+            role=role,
+        )
+        new_sources.append(src)
+        config.sources.append(src)
 
-    # Detect wide camera
-    wide_cam = ""
-    for s in sources:
-        if s["role"] == "wide":
-            wide_cam = s["name"]
+    # Re-detect wide camera
+    wide = ""
+    for s in config.sources:
+        if s.role == "wide":
+            wide = s.name
             break
-
-    config = ProjectConfig(
-        name=name,
-        sources=[CameraSource(
-            name=s["name"],
-            file_path=s["file_path"],
-            label=s["name"],
-            role=s["role"],
-        ) for s in sources],
-        wide_camera=wide_cam,
-    )
+    config.wide_camera = wide or config.wide_camera
 
     import yaml
     (proj_dir / "project.yaml").write_text(
         yaml.dump(config.model_dump(), default_flow_style=False)
     )
 
-    projects[project_id] = {
-        "status": "created",
-        "name": name,
-        "config": config,
-        "sources": sources,
-    }
-
-    return ProjectCreateResponse(project_id=project_id, sources=sources)
+    return {"status": "ok", "added": len(new_sources), "total_sources": len(config.sources)}
 
 
 @app.get("/api/projects/{project_id}")
@@ -896,7 +944,29 @@ th { color: #888; font-weight: 500; }
 <body>
 <div class="container">
   <h1 style="margin:16px 0 4px">🎙️ Podcast Editor</h1>
-  <p style="color:#666;margin-bottom:16px;font-size:13px">Drop footage, configure, auto-edit → DaVinci Resolve</p>
+  <p style="color:#666;margin-bottom:8px;font-size:13px">Drop footage, configure, auto-edit → DaVinci Resolve</p>
+
+  <!-- Project selector -->
+  <div style="display:flex;align-items:center;gap:10px;margin-bottom:16px;flex-wrap:wrap">
+    <select id="project-selector" style="width:auto;flex:1;min-width:200px" onchange="switchProject(this.value)">
+      <option value="">— Select project —</option>
+    </select>
+    <button class="btn btn-primary btn-sm" onclick="showNewProject()">+ New Project</button>
+    <span id="project-info" style="font-size:12px;color:#666"></span>
+  </div>
+  <!-- New project form (hidden) -->
+  <div id="new-project-form" style="display:none;margin-bottom:16px" class="panel">
+    <h3>New Project</h3>
+    <div style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap">
+      <div style="flex:1;min-width:150px">
+        <label>Project Name</label>
+        <input type="text" id="new-project-name" placeholder="My Podcast Ep 42" />
+      </div>
+      <button class="btn btn-primary" onclick="createNewProject()">Create</button>
+      <button class="btn btn-secondary" onclick="document.getElementById('new-project-form').style.display='none'">Cancel</button>
+    </div>
+    <div id="new-project-status"></div>
+  </div>
 
   <div class="tabs">
     <button class="tab active" data-tab="upload">1. Upload</button>
@@ -909,12 +979,14 @@ th { color: #888; font-weight: 500; }
   <!-- Tab 1: Upload -->
   <div id="tab-upload" class="tab-content active">
     <div class="panel">
-      <h3>New Project</h3>
-      <label>Project Name</label>
-      <input type="text" id="project-name" placeholder="My Podcast Ep 42" />
-      <label>Video Files</label>
+      <h3>Upload Footage</h3>
+      <p style="font-size:12px;color:#888;margin-bottom:8px">Upload proxy files (H.264 MP4) for the selected project</p>
+      <div id="upload-project-name" style="margin-bottom:8px;font-size:14px;color:#ccc"></div>
       <input type="file" id="file-input" multiple accept="video/*" />
-      <button class="btn btn-primary" onclick="createProject()" style="margin-top:12px">Create Project</button>
+      <label style="font-size:11px;color:#555;margin-top:4px">
+        Name files with "wide", "main", or "host" to auto-detect roles
+      </label>
+      <button class="btn btn-primary" onclick="uploadFiles()" style="margin-top:8px">Upload to Project</button>
       <div id="upload-status"></div>
     </div>
   </div>
@@ -1122,6 +1194,79 @@ th { color: #888; font-weight: 500; }
 let PROJECT_ID = '';
 let SOURCES = [];
 
+// ── Project Management ──────────────────────────────────────────────────────
+
+async function loadProjectList() {
+  try {
+    const data = await api('/api/projects/');
+    const sel = document.getElementById('project-selector');
+    const current = sel.value;
+    sel.innerHTML = '<option value="">— Select project —</option>';
+    for (const p of data.projects) {
+      const info = p.has_analysis ? ` (${p.analysis.duration_min || '?'}min)` : '';
+      sel.innerHTML += `<option value="${p.id}">${p.name} — ${p.sources} sources${info}</option>`;
+    }
+    if (current) sel.value = current;
+    // Auto-select if only one
+    if (data.projects.length === 1 && !PROJECT_ID) {
+      switchProject(data.projects[0].id);
+    }
+  } catch(e) { console.warn('Project list failed:', e); }
+}
+
+function showNewProject() {
+  document.getElementById('new-project-form').style.display = 'block';
+  document.getElementById('new-project-name').focus();
+}
+
+async function createNewProject() {
+  const name = document.getElementById('new-project-name').value.trim();
+  if (!name) return;
+  const form = new FormData(); form.append('name', name);
+  const status = document.getElementById('new-project-status');
+  try {
+    const data = await api('/api/projects/', { method: 'POST', body: form });
+    document.getElementById('new-project-form').style.display = 'none';
+    document.getElementById('new-project-name').value = '';
+    await loadProjectList();
+    switchProject(data.project_id);
+  } catch(e) {
+    setStatus(status, e.message, 'status-error');
+  }
+}
+
+async function switchProject(id) {
+  if (!id) return;
+  PROJECT_ID = id;
+  document.getElementById('project-selector').value = id;
+  document.getElementById('upload-project-name').textContent = `Project: ${id}`;
+
+  // Load project config
+  try {
+    const data = await api(`/api/projects/${id}`);
+    SOURCES = data.sources || [];
+    document.getElementById('project-info').textContent =
+      `${data.config?.wide_camera ? 'Wide: ' + data.config.wide_camera + ' | ' : ''}${SOURCES.length} sources`;
+    renderSources();
+    // Update config form with saved values
+    if (data.config) {
+      const c = data.config;
+      document.getElementById('var-min').value = c.variety_threshold_min ?? 10;
+      document.getElementById('var-max').value = c.variety_threshold_max ?? 25;
+      document.getElementById('wb-min').value = c.wide_break_min ?? 2;
+      document.getElementById('wb-max').value = c.wide_break_max ?? 5;
+      document.getElementById('min-shot').value = c.min_shot_duration ?? 2;
+      document.getElementById('dissolve').value = c.dissolve_duration ?? 0.5;
+    }
+  } catch(e) { console.warn('Project load failed:', e); }
+
+  // Reset player state
+  CUTLIST = null; WAVEFORM = null; COMMENTS = [];
+
+  // Auto-switch to upload tab
+  document.querySelector('[data-tab="upload"]').click();
+}
+
 // ── Navigation ──────────────────────────────────────────────────────────────
 
 document.querySelectorAll('.tab').forEach(tab => {
@@ -1148,27 +1293,28 @@ function setStatus(el, msg, cls = 'status-info') {
   el.innerHTML = `<div class="status-msg ${cls}">${msg}</div>`;
 }
 
+// Load project list on startup
+loadProjectList();
+
 // ── Upload ──────────────────────────────────────────────────────────────────
 
-async function createProject() {
-  const name = document.getElementById('project-name').value || 'Untitled';
+async function uploadFiles() {
+  if (!PROJECT_ID) { alert('Select or create a project first'); return; }
   const files = document.getElementById('file-input').files;
   const status = document.getElementById('upload-status');
 
   if (!files.length) { setStatus(status, 'Please select video files', 'status-error'); return; }
 
   const form = new FormData();
-  form.append('name', name);
   for (const f of files) form.append('files', f);
 
   setStatus(status, 'Uploading...', 'status-info');
 
   try {
-    const data = await api('/api/projects/', { method: 'POST', body: form });
-    PROJECT_ID = data.project_id;
-    SOURCES = data.sources;
-    setStatus(status, `Project created: ${PROJECT_ID} (${SOURCES.length} files)`, 'status-success');
-    renderSources();
+    const data = await api(`/api/projects/${PROJECT_ID}/files`, { method: 'POST', body: form });
+    setStatus(status, `Uploaded ${data.added} files (${data.total_sources} total)`, 'status-success');
+    document.getElementById('file-input').value = '';
+    await switchProject(PROJECT_ID);  // reload config
     document.querySelector('[data-tab="configure"]').click();
   } catch (e) {
     setStatus(status, `Error: ${e.message}`, 'status-error');
